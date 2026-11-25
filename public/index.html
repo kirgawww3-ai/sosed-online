@@ -1,9 +1,10 @@
 <!DOCTYPE html>
 <html lang="ru">
-<head><script src="/socket.io/socket.io.js"></script>
+<head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>Привет, Сосед: Дрифт-Погоня</title>
+<title>Привет, Сосед: Дрифт-Погоня (Онлайн)</title>
+<script src="/socket.io/socket.io.js"></script>
 <style>
   html,body{margin:0;height:100%;background:#111;overflow:hidden;font-family:monospace;touch-action:none}
   canvas{display:block;background:#222;image-rendering:pixelated}
@@ -29,6 +30,43 @@ let W, H;
 function resize(){ W = cv.width = innerWidth; H = cv.height = innerHeight; }
 resize(); addEventListener('resize', resize);
 
+// ================= ОНЛАЙН =================
+const socket = io();
+let myId = null;
+let hostId = null;
+const remotePlayers = {};
+
+socket.on('init', (data) => {
+  myId = data.id;
+  hostId = data.hostId;
+  for (const id in data.players) {
+    if (id !== myId) remotePlayers[id] = data.players[id];
+  }
+  if (myId !== hostId && data.neighbor) {
+    neighbor.x = data.neighbor.x;
+    neighbor.y = data.neighbor.y;
+    neighbor.angle = data.neighbor.angle;
+  }
+});
+
+socket.on('playerJoined', (p) => { remotePlayers[p.id] = p; });
+socket.on('playerMoved', (p) => {
+  if (remotePlayers[p.id]) { remotePlayers[p.id].x = p.x; remotePlayers[p.id].y = p.y; }
+});
+socket.on('playerLeft', (id) => { delete remotePlayers[id]; });
+
+socket.on('newHost', (newHostId) => { hostId = newHostId; });
+socket.on('neighborMoved', (data) => {
+  if (myId !== hostId) {
+    neighbor.x = data.x;
+    neighbor.y = data.y;
+    neighbor.angle = data.angle;
+    neighbor.state = data.state;
+  }
+});
+let sendTimer = 0;
+// ==========================================
+
 // ---------- Мир ----------
 const MAP_W = 2400, MAP_H = 1800;
 const world = {
@@ -37,13 +75,11 @@ const world = {
   door: {x: MAP_W/2-45, y: 40, w: 90, h: 30}
 };
 
-// Внешние стены
 world.walls.push({x:0,y:0,w:MAP_W,h:40});
 world.walls.push({x:0,y:MAP_H-40,w:MAP_W,h:40});
 world.walls.push({x:0,y:0,w:40,h:MAP_H});
 world.walls.push({x:MAP_W-40,y:0,w:40,h:MAP_H});
 
-// Внутренние препятствия (лабиринт)
 const obstacles = [
   [300,200,300,60],[700,200,60,300],[900,400,400,60],
   [1200,200,60,400],[400,500,400,60],[200,700,60,400],
@@ -54,7 +90,6 @@ const obstacles = [
 ];
 for(const o of obstacles) world.walls.push({x:o[0],y:o[1],w:o[2],h:o[3]});
 
-// Скользкие зоны
 const slips = [
   [350,350,180,150],[800,500,200,180],[1400,900,220,160],
   [600,1300,200,180],[1700,400,180,200],[1100,300,180,150],
@@ -93,7 +128,6 @@ const keys = {};
 addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if([' ','arrowup','arrowdown','arrowleft','arrowright'].includes(e.key.toLowerCase())) e.preventDefault(); });
 addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 
-// Джойстик
 const joy = document.getElementById('joy');
 const stick = document.getElementById('stick');
 let joyActive = false, joyId = null, joyX = 0, joyY = 0;
@@ -129,7 +163,6 @@ joy.addEventListener('mousedown', joyStart);
 addEventListener('mousemove', joyMove);
 addEventListener('mouseup', joyEnd);
 
-// Рывок
 const dashBtn = document.getElementById('dash');
 function doDash(){
   if(player.dashCD > 0) return;
@@ -226,6 +259,9 @@ function resolveNeighborCollisions(){
 }
 
 function updateNeighbor(dt){
+  // Если мы не хост, соседа двигает другой игрок (мы просто рисуем)
+  if(myId !== hostId) return;
+
   if(neighbor.state === 'flying'){
     neighbor.stunTimer -= dt;
     neighbor.x += neighbor.vx * dt;
@@ -284,7 +320,6 @@ function updateNeighbor(dt){
   neighbor.animT += dt * (1 + sp/300);
   resolveNeighborCollisions();
 
-  // Поймал игрока
   if(Math.hypot(neighbor.x-player.x, neighbor.y-player.y) < neighbor.r + player.r + 4){
     const ang = Math.atan2(player.y-neighbor.y, player.x-neighbor.x);
     player.x += Math.cos(ang)*60;
@@ -352,6 +387,25 @@ function drawShakalEnvironment(){
   }
 }
 
+function drawRemotePlayers(){
+  for(const id in remotePlayers){
+    const p = remotePlayers[id];
+    ctx.save();
+    ctx.translate(p.x - cam.x, p.y - cam.y);
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.beginPath(); ctx.ellipse(0, 16*0.9, 16*0.8, 16*0.35, 0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle = p.color || '#6aaa6a';
+    ctx.beginPath(); ctx.ellipse(0,0,16*0.75,16,0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#e0b090';
+    ctx.beginPath(); ctx.arc(0,-16*0.9,16*0.5,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(p.name || '???', 0, -30);
+    ctx.restore();
+  }
+}
+
 function drawPlayer(){
   ctx.save();
   ctx.translate(player.x-cam.x, player.y-cam.y);
@@ -363,7 +417,6 @@ function drawPlayer(){
   ctx.beginPath(); ctx.ellipse(0,0,player.r*0.75,player.r,0,0,Math.PI*2); ctx.fill();
   ctx.fillStyle = '#e0b090';
   ctx.beginPath(); ctx.arc(0,-player.r*0.9,player.r*0.5,0,Math.PI*2); ctx.fill();
-  // стрелка направления
   const sp = Math.hypot(player.vx,player.vy);
   if(sp > 30){
     const a = Math.atan2(player.vy, player.vx);
@@ -375,7 +428,6 @@ function drawPlayer(){
     ctx.closePath(); ctx.fill();
     ctx.restore();
   }
-  // индикатор рывка
   if(player.dashCD > 0){
     ctx.strokeStyle = 'rgba(255,100,100,0.6)';
     ctx.lineWidth = 3;
@@ -443,9 +495,11 @@ let surviveTime = 0;
 function render(){
   ctx.clearRect(0,0,W,H);
   drawShakalEnvironment();
+  drawRemotePlayers(); // Рисуем других игроков
   drawNeighbor();
   drawPlayer();
-  // мини-карта
+  
+  // Мини-карта
   const ms = 120, mx = W-ms-10, my = 10;
   ctx.fillStyle = 'rgba(0,0,0,0.5)';
   ctx.fillRect(mx,my,ms,ms*MAP_H/MAP_W);
@@ -465,11 +519,28 @@ let last = performance.now();
 function loop(now){
   const dt = Math.min((now-last)/1000, 0.05);
   last = now;
+  
   updatePlayer(dt);
   updateNeighbor(dt);
   updateCamera(dt);
   surviveTime += dt;
   document.getElementById('time').textContent = surviveTime.toFixed(1);
+
+  // Отправка координат
+  sendTimer += dt;
+  if (sendTimer > 0.05) {
+    sendTimer = 0;
+    socket.emit('move', { x: player.x, y: player.y });
+    if (myId === hostId) {
+      socket.emit('neighbor', { 
+        x: neighbor.x, 
+        y: neighbor.y, 
+        angle: neighbor.angle,
+        state: neighbor.state
+      });
+    }
+  }
+
   render();
   requestAnimationFrame(loop);
 }
