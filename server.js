@@ -63,6 +63,10 @@ io.on('connection', (socket) => {
   socket.on('neighbor', (data) => {
     if (socket.id === hostId) {
       neighbor = data;
+// Синхронизация дверей
+socket.on('openDoor', (doorId) => {
+  socket.broadcast.emit('doorOpened', doorId);
+});
       socket.broadcast.emit('neighborMoved', data);
     }
   });
