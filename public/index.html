@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Привет, Сосед: Дрифт-Погоня</title>
+<style>
+  html,body{margin:0;height:100%;background:#111;overflow:hidden;font-family:monospace;touch-action:none}
+  canvas{display:block;background:#222;image-rendering:pixelated}
+  #hud{position:fixed;top:10px;left:10px;color:#fff;font-size:16px;text-shadow:2px 2px #000;z-index:10;pointer-events:none}
+  #msg{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font-size:28px;text-align:center;text-shadow:3px 3px #000;z-index:10;pointer-events:none;opacity:0;transition:opacity .3s}
+  #joy{position:fixed;bottom:30px;left:30px;width:140px;height:140px;border-radius:50%;background:rgba(255,255,255,0.12);border:2px solid rgba(255,255,255,0.3);z-index:20;touch-action:none}
+  #stick{position:absolute;width:60px;height:60px;border-radius:50%;background:rgba(255,255,255,0.5);left:40px;top:40px;pointer-events:none}
+  #dash{position:fixed;bottom:50px;right:40px;width:100px;height:100px;border-radius:50%;background:rgba(255,80,80,0.35);border:2px solid rgba(255,120,120,0.7);z-index:20;color:#fff;font-size:14px;display:flex;align-items:center;justify-content:center;user-select:none;touch-action:none}
+  #dash:active{background:rgba(255,80,80,0.7)}
+  @media(min-width:800px){#joy,#dash{display:none}}
+</style>
+</head>
+<body>
+<div id="hud">Выжил: <span id="time">0</span>с | Улётов: <span id="flights">0</span> | Комбо: <span id="combo">0</span></div>
+<div id="msg"></div>
+<canvas id="c"></canvas>
+<div id="joy"><div id="stick"></div></div>
+<div id="dash">РЫВОК</div>
+<script>
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let W, H;
+function resize(){ W = cv.width = innerWidth; H = cv.height = innerHeight; }
+resize(); addEventListener('resize', resize);
+
+// ---------- Мир ----------
+const MAP_W = 2400, MAP_H = 1800;
+const world = {
+  walls: [],
+  slippery: [],
+  door: {x: MAP_W/2-45, y: 40, w: 90, h: 30}
+};
+
+// Внешние стены
+world.walls.push({x:0,y:0,w:MAP_W,h:40});
+world.walls.push({x:0,y:MAP_H-40,w:MAP_W,h:40});
+world.walls.push({x:0,y:0,w:40,h:MAP_H});
+world.walls.push({x:MAP_W-40,y:0,w:40,h:MAP_H});
+
+// Внутренние препятствия (лабиринт)
+const obstacles = [
+  [300,200,300,60],[700,200,60,300],[900,400,400,60],
+  [1200,200,60,400],[400,500,400,60],[200,700,60,400],
+  [500,800,300,60],[1000,700,60,500],[1300,700,400,60],
+  [1800,300,60,500],[1900,900,300,60],[600,1100,500,60],
+  [200,1300,400,60],[900,1200,60,400],[1100,1400,400,60],
+  [1600,1200,60,400],[1800,1500,400,60],[400,1500,300,60]
+];
+for(const o of obstacles) world.walls.push({x:o[0],y:o[1],w:o[2],h:o[3]});
+
+// Скользкие зоны
+const slips = [
+  [350,350,180,150],[800,500,200,180],[1400,900,220,160],
+  [600,1300,200,180],[1700,400,180,200],[1100,300,180,150],
+  [200,1000,180,160],[1900,1000,200,180]
+];
+for(const s of slips) world.slippery.push({x:s[0],y:s[1],w:s[2],h:s[3]});
+
+// ---------- Игрок ----------
+const player = {
+  x: MAP_W/2, y: MAP_H-120,
+  r: 16,
+  speed: 280,
+  vx: 0, vy: 0,
+  dashCD: 0,
+  dashTime: 0
+};
+
+// ---------- Сосед ----------
+const neighbor = {
+  x: MAP_W/2, y: MAP_H/2,
+  vx: 0, vy: 0,
+  r: 22,
+  angle: 0,
+  spin: 0,
+  state: 'run',
+  stunTimer: 0,
+  animT: 0,
+  flights: 0,
+  combo: 0,
+  comboTimer: 0,
+  target: {x: player.x, y: player.y}
+};
+
+// ---------- Управление ----------
+const keys = {};
+addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if([' ','arrowup','arrowdown','arrowleft','arrowright'].includes(e.key.toLowerCase())) e.preventDefault(); });
+addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+// Джойстик
+const joy = document.getElementById('joy');
+const stick = document.getElementById('stick');
+let joyActive = false, joyId = null, joyX = 0, joyY = 0;
+const JOY_R = 50;
+
+function joyStart(e){
+  const t = e.changedTouches ? e.changedTouches[0] : e;
+  joyActive = true; joyId = t.identifier ?? 'mouse';
+  joyMove(e);
+}
+function joyMove(e){
+  if(!joyActive) return;
+  const t = e.changedTouches ? [...e.changedTouches].find(x=>x.identifier===joyId) : e;
+  if(!t) return;
+  const rect = joy.getBoundingClientRect();
+  const cx = rect.left + rect.width/2;
+  const cy = rect.top + rect.height/2;
+  let dx = t.clientX - cx, dy = t.clientY - cy;
+  const d = Math.hypot(dx,dy);
+  if(d > JOY_R){ dx = dx/d*JOY_R; dy = dy/d*JOY_R; }
+  joyX = dx/JOY_R; joyY = dy/JOY_R;
+  stick.style.left = (40+dx)+'px';
+  stick.style.top = (40+dy)+'px';
+}
+function joyEnd(){
+  joyActive = false; joyId = null; joyX = 0; joyY = 0;
+  stick.style.left = '40px'; stick.style.top = '40px';
+}
+joy.addEventListener('touchstart', e=>{ e.preventDefault(); joyStart(e); }, {passive:false});
+joy.addEventListener('touchmove', e=>{ e.preventDefault(); joyMove(e); }, {passive:false});
+joy.addEventListener('touchend', e=>{ e.preventDefault(); joyEnd(); }, {passive:false});
+joy.addEventListener('mousedown', joyStart);
+addEventListener('mousemove', joyMove);
+addEventListener('mouseup', joyEnd);
+
+// Рывок
+const dashBtn = document.getElementById('dash');
+function doDash(){
+  if(player.dashCD > 0) return;
+  player.dashCD = 1.5;
+  player.dashTime = 0.18;
+  const sp = Math.hypot(player.vx, player.vy) || 1;
+  player.vx = player.vx/sp * 900;
+  player.vy = player.vy/sp * 900;
+}
+dashBtn.addEventListener('touchstart', e=>{ e.preventDefault(); doDash(); }, {passive:false});
+dashBtn.addEventListener('mousedown', doDash);
+
+// ---------- Физика ----------
+const ACCEL = 560, MAX_SPEED = 460, FRICTION = 1.3, ICE_FRICTION = 0.15, TURN = 2.8;
+
+function isSlippery(x,y){
+  return world.slippery.some(s => x>s.x && x<s.x+s.w && y>s.y && y<s.y+s.h);
+}
+function circleRect(cx,cy,r,rect){
+  const nx = Math.max(rect.x, Math.min(cx, rect.x+rect.w));
+  const ny = Math.max(rect.y, Math.min(cy, rect.y+rect.h));
+  const dx = cx-nx, dy = cy-ny;
+  return dx*dx+dy*dy < r*r;
+}
+
+function updatePlayer(dt){
+  let dx = 0, dy = 0;
+  if(keys['arrowleft']||keys['a']) dx -= 1;
+  if(keys['arrowright']||keys['d']) dx += 1;
+  if(keys['arrowup']||keys['w']) dy -= 1;
+  if(keys['arrowdown']||keys['s']) dy += 1;
+  dx += joyX; dy += joyY;
+  const len = Math.hypot(dx,dy);
+  if(len > 0.1){
+    dx/=len; dy/=len;
+    const acc = player.dashTime>0 ? 2000 : player.speed*4;
+    player.vx += dx*acc*dt;
+    player.vy += dy*acc*dt;
+  }
+  if(player.dashTime > 0){ player.dashTime -= dt; }
+  else {
+    player.vx *= (1 - 6*dt);
+    player.vy *= (1 - 6*dt);
+  }
+  const sp = Math.hypot(player.vx,player.vy);
+  const maxSp = player.dashTime>0 ? 900 : player.speed;
+  if(sp > maxSp){ player.vx = player.vx/sp*maxSp; player.vy = player.vy/sp*maxSp; }
+  player.x += player.vx*dt;
+  player.y += player.vy*dt;
+  if(player.dashCD > 0) player.dashCD -= dt;
+
+  for(const w of world.walls){
+    if(circleRect(player.x, player.y, player.r, w)){
+      const nx = Math.max(w.x, Math.min(player.x, w.x+w.w));
+      const ny = Math.max(w.y, Math.min(player.y, w.y+w.h));
+      let ddx = player.x-nx, ddy = player.y-ny;
+      let d = Math.hypot(ddx,ddy)||1;
+      player.x = nx + ddx/d*player.r;
+      player.y = ny + ddy/d*player.r;
+      player.vx *= 0.3; player.vy *= 0.3;
+    }
+  }
+}
+
+function resolveNeighborCollisions(){
+  for(const w of world.walls){
+    if(circleRect(neighbor.x, neighbor.y, neighbor.r, w)){
+      const nx = Math.max(w.x, Math.min(neighbor.x, w.x+w.w));
+      const ny = Math.max(w.y, Math.min(neighbor.y, w.y+w.h));
+      let dx = neighbor.x-nx, dy = neighbor.y-ny;
+      let d = Math.hypot(dx,dy) || 1;
+      dx/=d; dy/=d;
+      neighbor.x = nx + dx*neighbor.r;
+      neighbor.y = ny + dy*neighbor.r;
+      const speed = Math.hypot(neighbor.vx, neighbor.vy);
+      if(speed > 200){
+        neighbor.state = 'flying';
+        neighbor.stunTimer = 1.2;
+        neighbor.vx = dx * speed * 1.5;
+        neighbor.vy = dy * speed * 1.5;
+        neighbor.spin = (Math.random()-0.5) * 22;
+        neighbor.flights++;
+        neighbor.combo++;
+        neighbor.comboTimer = 3;
+        document.getElementById('flights').textContent = neighbor.flights;
+        document.getElementById('combo').textContent = neighbor.combo;
+        showMsg('ЗДАРОВА! 💥');
+      } else {
+        neighbor.vx = dx * 150;
+        neighbor.vy = dy * 150;
+      }
+    }
+  }
+}
+
+function updateNeighbor(dt){
+  if(neighbor.state === 'flying'){
+    neighbor.stunTimer -= dt;
+    neighbor.x += neighbor.vx * dt;
+    neighbor.y += neighbor.vy * dt;
+    neighbor.angle += neighbor.spin * dt;
+    neighbor.vx *= 0.98; neighbor.vy *= 0.98;
+    for(const w of world.walls){
+      if(circleRect(neighbor.x, neighbor.y, neighbor.r, w)){
+        const nx = Math.max(w.x, Math.min(neighbor.x, w.x+w.w));
+        const ny = Math.max(w.y, Math.min(neighbor.y, w.y+w.h));
+        let dx = neighbor.x-nx, dy = neighbor.y-ny;
+        let d = Math.hypot(dx,dy)||1; dx/=d; dy/=d;
+        neighbor.x = nx + dx*neighbor.r;
+        neighbor.y = ny + dy*neighbor.r;
+        neighbor.vx *= -0.6; neighbor.vy *= -0.6;
+        neighbor.spin *= 0.5;
+      }
+    }
+    if(neighbor.stunTimer <= 0){
+      neighbor.state = 'run';
+      neighbor.spin = 0;
+      neighbor.angle = 0;
+      neighbor.vx *= 0.2; neighbor.vy *= 0.2;
+    }
+    return;
+  }
+
+  neighbor.target.x = player.x;
+  neighbor.target.y = player.y;
+  let tx = neighbor.target.x - neighbor.x;
+  let ty = neighbor.target.y - neighbor.y;
+  const dist = Math.hypot(tx,ty) || 1;
+  tx/=dist; ty/=dist;
+
+  const slip = isSlippery(neighbor.x, neighbor.y);
+  const acc = slip ? ACCEL*0.6 : ACCEL;
+  neighbor.vx += tx * acc * dt;
+  neighbor.vy += ty * acc * dt;
+
+  const sp = Math.hypot(neighbor.vx, neighbor.vy);
+  if(sp > MAX_SPEED){ neighbor.vx = neighbor.vx/sp*MAX_SPEED; neighbor.vy = neighbor.vy/sp*MAX_SPEED; }
+
+  const fr = slip ? ICE_FRICTION : FRICTION;
+  neighbor.vx *= (1 - fr*dt);
+  neighbor.vy *= (1 - fr*dt);
+
+  neighbor.x += neighbor.vx * dt;
+  neighbor.y += neighbor.vy * dt;
+
+  const moveAngle = Math.atan2(neighbor.vy, neighbor.vx);
+  let diff = moveAngle - neighbor.angle;
+  while(diff > Math.PI) diff -= Math.PI*2;
+  while(diff < -Math.PI) diff += Math.PI*2;
+  neighbor.angle += diff * TURN * dt;
+
+  neighbor.animT += dt * (1 + sp/300);
+  resolveNeighborCollisions();
+
+  // Поймал игрока
+  if(Math.hypot(neighbor.x-player.x, neighbor.y-player.y) < neighbor.r + player.r + 4){
+    const ang = Math.atan2(player.y-neighbor.y, player.x-neighbor.x);
+    player.x += Math.cos(ang)*60;
+    player.y += Math.sin(ang)*60;
+    player.vx = Math.cos(ang)*400;
+    player.vy = Math.sin(ang)*400;
+    showMsg('Сосед тебя поймал! ЗДАРОВА!');
+  }
+
+  if(neighbor.comboTimer > 0){
+    neighbor.comboTimer -= dt;
+    if(neighbor.comboTimer <= 0){
+      neighbor.combo = 0;
+      document.getElementById('combo').textContent = 0;
+    }
+  }
+}
+
+// ---------- Камера ----------
+const cam = {x:0, y:0};
+function updateCamera(dt){
+  const targetX = player.x - W/2;
+  const targetY = player.y - H/2;
+  cam.x += (targetX - cam.x) * 8 * dt;
+  cam.y += (targetY - cam.y) * 8 * dt;
+  cam.x = Math.max(0, Math.min(MAP_W - W, cam.x));
+  cam.y = Math.max(0, Math.min(MAP_H - H, cam.y));
+}
+
+// ---------- Отрисовка ----------
+function drawShakalEnvironment(){
+  const startX = Math.floor(cam.x/60)*60;
+  const startY = Math.floor(cam.y/60)*60;
+  const endX = cam.x + W + 60;
+  const endY = cam.y + H + 60;
+  for(let y=startY; y<endY; y+=60){
+    for(let x=startX; x<endX; x+=60){
+      ctx.fillStyle = ((x/60+y/60)%2===0) ? '#5a4a3a' : '#4a3a2a';
+      ctx.fillRect(x-cam.x, y-cam.y, 60, 60);
+    }
+  }
+  for(const w of world.walls){
+    if(w.x+w.w < cam.x-50 || w.x > cam.x+W+50 || w.y+w.h < cam.y-50 || w.y > cam.y+H+50) continue;
+    ctx.fillStyle = '#3a2a1a';
+    ctx.fillRect(w.x-cam.x, w.y-cam.y, w.w, w.h);
+    ctx.strokeStyle = '#6a5a4a';
+    ctx.lineWidth = 2;
+    const step = 25;
+    for(let i=0;i<w.w;i+=step){
+      for(let j=0;j<w.h;j+=step){
+        ctx.beginPath();
+        ctx.arc(w.x-cam.x+i+12, w.y-cam.y+j+12, 5, 0, Math.PI*2);
+        ctx.stroke();
+      }
+    }
+  }
+  for(const s of world.slippery){
+    if(s.x+s.w < cam.x-50 || s.x > cam.x+W+50 || s.y+s.h < cam.y-50 || s.y > cam.y+H+50) continue;
+    ctx.fillStyle = 'rgba(100,200,255,0.25)';
+    ctx.fillRect(s.x-cam.x, s.y-cam.y, s.w, s.h);
+    ctx.strokeStyle = 'rgba(150,220,255,0.6)';
+    ctx.setLineDash([8,8]);
+    ctx.strokeRect(s.x-cam.x, s.y-cam.y, s.w, s.h);
+    ctx.setLineDash([]);
+  }
+}
+
+function drawPlayer(){
+  ctx.save();
+  ctx.translate(player.x-cam.x, player.y-cam.y);
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.beginPath(); ctx.ellipse(0, player.r*0.9, player.r*0.8, player.r*0.35, 0,0,Math.PI*2); ctx.fill();
+  const g = ctx.createRadialGradient(-4,-4,2,0,0,player.r);
+  g.addColorStop(0,'#6aaa6a'); g.addColorStop(1,'#2a5a2a');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.ellipse(0,0,player.r*0.75,player.r,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#e0b090';
+  ctx.beginPath(); ctx.arc(0,-player.r*0.9,player.r*0.5,0,Math.PI*2); ctx.fill();
+  // стрелка направления
+  const sp = Math.hypot(player.vx,player.vy);
+  if(sp > 30){
+    const a = Math.atan2(player.vy, player.vx);
+    ctx.save();
+    ctx.rotate(a);
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.beginPath();
+    ctx.moveTo(player.r+8, 0); ctx.lineTo(player.r+2, -5); ctx.lineTo(player.r+2, 5);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  // индикатор рывка
+  if(player.dashCD > 0){
+    ctx.strokeStyle = 'rgba(255,100,100,0.6)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(0,0,player.r+6, -Math.PI/2, -Math.PI/2 + Math.PI*2*(1-player.dashCD/1.5));
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawNeighbor(){
+  const n = neighbor;
+  ctx.save();
+  ctx.translate(n.x-cam.x, n.y-cam.y);
+  ctx.rotate(n.angle);
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.beginPath(); ctx.ellipse(0, n.r*0.9, n.r*0.9, n.r*0.4, 0, 0, Math.PI*2); ctx.fill();
+  const g = ctx.createLinearGradient(-n.r, -n.r, n.r, n.r);
+  g.addColorStop(0, '#3a5a8a'); g.addColorStop(1, '#1a2a4a');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.ellipse(0,0,n.r*0.8,n.r,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#c9a227';
+  ctx.fillRect(-n.r*0.8, -2, n.r*1.6, 6);
+  ctx.fillStyle = '#e0b090';
+  ctx.beginPath(); ctx.arc(0, -n.r*0.9, n.r*0.55, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(-6,-n.r*1.0,4,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(6,-n.r*1.0,4,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.arc(-6,-n.r*1.0,2,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(6,-n.r*1.0,2,0,Math.PI*2); ctx.fill();
+  const leg = Math.sin(n.animT*18) * 6;
+  ctx.fillStyle = '#8a4a2a';
+  ctx.beginPath(); ctx.ellipse(-8, n.r*0.8+leg, 6, 4, 0,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(8, n.r*0.8-leg, 6, 4, 0,0,Math.PI*2); ctx.fill();
+  const arm = Math.cos(n.animT*18) * 5;
+  ctx.strokeStyle = '#3a5a8a';
+  ctx.lineWidth = 6;
+  ctx.beginPath(); ctx.moveTo(-n.r*0.7,0); ctx.lineTo(-n.r*1.3, arm); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(n.r*0.7,0); ctx.lineTo(n.r*1.3, -arm); ctx.stroke();
+  if(n.state==='flying'){
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 16px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('ЗДАРОВА!', 0, -n.r*2);
+  }
+  ctx.restore();
+  if(n.state==='run' && Math.hypot(n.vx,n.vy) > 200){
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.beginPath();
+    ctx.arc(n.x-cam.x - n.vx*0.03, n.y-cam.y - n.vy*0.03, 8, 0, Math.PI*2);
+    ctx.fill();
+  }
+}
+
+function showMsg(text){
+  const m = document.getElementById('msg');
+  m.textContent = text;
+  m.style.opacity = 1;
+  clearTimeout(showMsg._t);
+  showMsg._t = setTimeout(()=>{ m.style.opacity = 0; }, 1200);
+}
+
+let surviveTime = 0;
+function render(){
+  ctx.clearRect(0,0,W,H);
+  drawShakalEnvironment();
+  drawNeighbor();
+  drawPlayer();
+  // мини-карта
+  const ms = 120, mx = W-ms-10, my = 10;
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(mx,my,ms,ms*MAP_H/MAP_W);
+  const sc = ms/MAP_W;
+  for(const w of world.walls){
+    ctx.fillStyle = 'rgba(120,90,60,0.7)';
+    ctx.fillRect(mx+w.x*sc, my+w.y*sc, Math.max(1,w.w*sc), Math.max(1,w.h*sc));
+  }
+  ctx.fillStyle = '#4a8a4a';
+  ctx.beginPath(); ctx.arc(mx+player.x*sc, my+player.y*sc, 3, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#8a2a2a';
+  ctx.beginPath(); ctx.arc(mx+neighbor.x*sc, my+neighbor.y*sc, 3, 0, Math.PI*2); ctx.fill();
+}
+
+// ---------- Цикл ----------
+let last = performance.now();
+function loop(now){
+  const dt = Math.min((now-last)/1000, 0.05);
+  last = now;
+  updatePlayer(dt);
+  updateNeighbor(dt);
+  updateCamera(dt);
+  surviveTime += dt;
+  document.getElementById('time').textContent = surviveTime.toFixed(1);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
